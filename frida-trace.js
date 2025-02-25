@@ -1,5 +1,3 @@
-// traceAddr(addr)
-// ---------------------------------------------------------------------------------------
 let moduleBase;
 let pre_regs = [];
 let infoMap = new Map();
@@ -104,7 +102,12 @@ function isRegsChange(context, ins) {
                 let changeString = "";
                 try {
                     let nativePointer = new NativePointer(currentReg);
-                    changeString = nativePointer.readCString();
+                    changeString = hexdump(nativePointer, {
+                        offset: 0, // 从指针开始的位置
+                        length: 4, // 读取 4 字节（32 位）
+                        header: false, // 不需要输出地址头部
+                        ansi: false // 不需要颜色高亮
+                    });
                 } catch (e) {
                     changeString = "";
                 }
@@ -117,10 +120,62 @@ function isRegsChange(context, ins) {
             }
         }
     }
-    
+
     entity.info = logInfo;
     pre_regs = currentRegs;
     return entity;
+}
+
+const getSandboxPath = () => {
+    var address = Module.findExportByName('Foundation', 'NSSearchPathForDirectoriesInDomains')
+    var NSSearchPathForDirectoriesInDomains = new NativeFunction(address, 'pointer', ['int', 'int', 'int'])
+    var dirs = ObjC.Object(NSSearchPathForDirectoriesInDomains(9, 1, 1))
+    return dirs.objectAtIndex_(0).toString()
+};
+
+function appendToSandbox(filename, content) {
+    const NSString = ObjC.classes.NSString;
+    const NSFileManager = ObjC.classes.NSFileManager;
+    const NSFileHandle = ObjC.classes.NSFileHandle;
+
+    // 获取沙盒路径
+    const sandboxPath = ObjC.classes.NSString.stringWithString_(getSandboxPath());
+    const filePath = sandboxPath.stringByAppendingPathComponent_(NSString.stringWithString_(filename));
+
+    const fileManager = NSFileManager.defaultManager();
+
+    // 检查文件是否存在
+    if (!fileManager.fileExistsAtPath_(filePath)) {
+        console.log('[+] 文件不存在，创建新文件: ' + filePath.toString());
+        // 如果文件不存在，创建新文件并写入初始内容
+        const initialContent = NSString.stringWithString_(content);
+        const success = initialContent.writeToFile_atomically_encoding_error_(
+            filePath,
+            true,
+            4, // NSUTF8StringEncoding
+            NULL
+        );
+        if (success) {
+            console.log('[+] 初始内容写入成功: ' + filePath.toString());
+        } else {
+            console.error('[-] 初始内容写入失败');
+        }
+        return;
+    }
+
+    // 文件存在，追加写入
+    try {
+        const fileHandle = NSFileHandle.fileHandleForWritingAtPath_(filePath);
+        fileHandle.seekToEndOfFile(); // 移动到文件末尾
+        const dataToAppend = NSString.stringWithString_(content).dataUsingEncoding_(4); // NSUTF8StringEncoding
+        fileHandle.writeData_(dataToAppend);
+        fileHandle.closeFile();
+        const currentTime = new Date(); // 获取当前时间
+        const timestamp = `[${currentTime.toISOString()}]`; // 格式化为 ISO 时间戳
+        console.log(`[+] 日志追加成功: ${filePath.toString()} ${timestamp}`);
+    } catch (err) {
+        console.error('[-] 日志追加失败: ' + err.message);
+    }
 }
 
 function stalkerTraceRange(tid, base, size, offsetAddr) {
@@ -128,32 +183,37 @@ function stalkerTraceRange(tid, base, size, offsetAddr) {
         transform: (iterator) => {
             const instruction = iterator.next();
             const startAddress = instruction.address;
-            const isModuleCode = startAddress.compare(base) >= 0 &&
+            // console.log(ptr(startAddress.sub(base)), ptr(startAddress), ptr(base), ptr(size), startAddress.compare(base), startAddress.compare(base.add(size)))
+            var isModuleCode = startAddress.compare(base) >= 0 &&
                 startAddress.compare(base.add(size)) < 0;
             do {
                 iterator.keep();
                 if (isModuleCode) {
-                    let lastInfo = '[' + ptr(instruction["address"] - base) + ']' + '\t' + ptr(instruction["address"]) + '\t' + (instruction+';').padEnd(30,' ');
+                    let lastInfo = '[' + ptr(instruction["address"] - base) + ']' + '\t' + ptr(instruction["address"]) + '\t' + (instruction + ';').padEnd(30, ' ');
                     let address = instruction.address - base;
                     detailInsMap.set(String(address), JSON.stringify(instruction));
                     infoMap.set(String(address), lastInfo);
 
                     iterator.putCallout((context) => {
+
                         let offset = Number(context.pc) - base;
                         let detailIns = detailInsMap.get(String(offset));
-                        
+                        //
                         let insinfo = infoMap.get(String(offset));
                         let entity = isRegsChange(context, detailIns);
                         let info = insinfo + '\t#' + entity.info;
-
+                        //
                         let next_pc = context.pc.add(4);
                         let insn_next = Instruction.parse(next_pc);
-                        insinfo = '[' + ptr(insn_next["address"] - base) + ']' + '\t' + ptr(insn_next["address"]) + '\t' + (insn_next + ';').padEnd(30,' ');
+
+                        insinfo = '[' + ptr(insn_next["address"] - base) + ']' + '\t' + ptr(insn_next["address"]) + '\t' + (insn_next + ';').padEnd(30, ' ');
                         let mnemonic = insn_next.mnemonic;
-                        if (mnemonic.startsWith("b.") || mnemonic === "b" || mnemonic === "bl" || mnemonic === "br" ||  mnemonic === "bx" || mnemonic.startsWith("bl") || mnemonic.startsWith("bx")) {
+                        if (mnemonic.startsWith("b.") || mnemonic === "b" || mnemonic === "bl" || mnemonic === "br" || mnemonic === "bx" || mnemonic.startsWith("bl") || mnemonic.startsWith("bx")) {
                             info = info + '\n' + insinfo + '\t#';
                         }
-                        console.log(info);
+                        // console.log(info);
+                        // 将日志追加写入沙盒文件
+                        appendToSandbox('frida_trace_code.txt', info + '\n');
                     });
                 }
             } while (iterator.next() !== null);
@@ -161,18 +221,19 @@ function stalkerTraceRange(tid, base, size, offsetAddr) {
     })
 }
 
-function traceAddr(addr,base_addr) {
-    let moduleMap = new ModuleMap();
-    let targetModule = moduleMap.find(addr);
 
-    console.log('-----start trace：', addr, '------');
-    moduleBase = base_addr;
-    Interceptor.attach(addr, {
-        onEnter: function(args) {
+function traceAddr(addr, targetModule) {
+    console.log('-----start trace：', targetModule.base, targetModule.base + addr, '------');
+    moduleBase = targetModule;
+    var target_addr = targetModule.base.add(addr)
+    console.log("target_addr", target_addr)
+    Interceptor.attach(target_addr, {
+        onEnter: function (args) {
             this.tid = Process.getCurrentThreadId()
-            stalkerTraceRange(this.tid,targetModule.base,targetModule.size,addr);
+            //动态库需要手动计算大小，frida获取不准
+            stalkerTraceRange(this.tid, targetModule.base, targetModule.size, target_addr);
         },
-        onLeave: function(ret) {
+        onLeave: function (ret) {
             Stalker.unfollow(this.tid);
             Stalker.garbageCollect();
             console.log('ret: ' + ret);
@@ -180,24 +241,26 @@ function traceAddr(addr,base_addr) {
         }
     });
 }
+
 // ---------------------------------------------------------------------------------------
 
-// traceNativeFunction
 // ---------------------------------------------------------------------------------------
 // 打印调用堆栈
-function traceFunction(addr, base_addr){
-    
-    let moduleMap = new ModuleMap();
-    let base_size = moduleMap.find(addr).size;
-
-    Interceptor.attach(addr, {
-        onEnter: function(args) {
+function traceFunction(addr, targetModule) {
+    var base_addr = targetModule.base
+    var base_size = targetModule.size
+    console.log('-----start trace：', targetModule.base, targetModule.base + addr, '------');
+    moduleBase = targetModule;
+    var target_addr = targetModule.base.add(addr)
+    console.log("target_addr", target_addr)
+    Interceptor.attach(target_addr, {
+        onEnter: function (args) {
             this.tid = Process.getCurrentThreadId();
             Stalker.follow(this.tid, {
                 events: {
                     call: true
                 },
-                onReceive: function(events) {
+                onReceive: function (events) {
                     let allEvents = Stalker.parse(events);
                     let first_depth = 0;
                     let is_first = true;
@@ -214,21 +277,32 @@ function traceFunction(addr, base_addr){
                                     is_first = false;
                                     first_depth = depth;
                                 }
-                                let location_description = ' [' + ptr(location).sub(base_addr) + '] ';
-                                let target_description = ' [' + ptr(target).sub(base_addr) + ']';
+                                //+0x100000000 是为了在ida中方便跳转
+                                let location_description = ' [' + ptr(location).sub(base_addr).add(0x100000000) + '] ';
+                                let target_description = ' [' + ptr(target).sub(base_addr).add(0x100000000) + ']';
                                 let length = (depth - first_depth);
                                 for (let j = 0; j < length; j++) {
                                     space_num = space_num + ' ';
                                 }
                                 description = space_num + target_description + '(' + location_description + ')' + ' -- ' + length;
-                                console.log(description); 
-                            } 
+                                appendToSandbox('frida_trace_func.txt', description + '\n');
+                            }
                         }
                     }
                 }
             })
-        }, onLeave: function(retval) {
+        }, onLeave: function (retval) {
             Stalker.unfollow(this.tid);
         }
     })
+}
+
+let module_name = "SecTest"
+var tmpmods = Process.enumerateModulesSync();
+for (var i = 0; i < tmpmods.length; i++) {
+    if (tmpmods[i].name.indexOf(module_name) > -1) {
+        console.log(JSON.stringify(tmpmods[i]))
+        traceAddr(0x00000A12C, tmpmods[i]); //trace_code
+        traceFunction(0x00000A12C, tmpmods[i]);//trace_func
+    }
 }
